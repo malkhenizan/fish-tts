@@ -1,0 +1,9 @@
+Voice pack layout (folder name == voice_id):
+
+  voices/
+    my-speaker/
+      sample.wav    # 10–30s clean reference audio
+      sample.lab    # exact transcript of sample.wav (plain text)
+
+Then call:
+  POST /v1/tts  {"text": "...", "voice_id": "my-speaker"}

@@ -1,0 +1,36 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights & local voice data (persisted via Docker volumes)
+checkpoints/*
+!checkpoints/.gitkeep
+voices/*
+!voices/.gitkeep
+!voices/README.example
+
+# Runtime / OS
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Audio artifacts
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.npy
