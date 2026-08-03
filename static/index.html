@@ -350,7 +350,13 @@
         const reader = new FileReader();
         reader.onload = () => {
           const result = String(reader.result || "");
-          const b64 = result.includes(",") ? result.split(",", 1)[1] : result;
+          // NOTE: String.split(",", 1) returns only 1 element — do NOT use it here.
+          const comma = result.indexOf(",");
+          const b64 = comma >= 0 ? result.slice(comma + 1) : result;
+          if (!b64) {
+            reject(new Error("Failed to encode audio as base64"));
+            return;
+          }
           resolve(b64);
         };
         reader.onerror = reject;
