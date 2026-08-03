@@ -110,6 +110,8 @@
     .status.ok::before { background: var(--ok); box-shadow: 0 0 0 3px rgba(61,220,151,0.15); }
     .status.bad { color: var(--danger); border-color: rgba(255,123,114,0.28); }
     .status.bad::before { background: var(--danger); }
+    .status.busy { color: #ffd28a; border-color: rgba(255,210,138,0.3); }
+    .status.busy::before { background: #ffd28a; box-shadow: 0 0 0 3px rgba(255,210,138,0.15); }
 
     .hero {
       margin-bottom: 1.25rem;
@@ -326,7 +328,10 @@
           <span>Voice cloning studio</span>
         </div>
       </a>
-      <div id="health" class="status">checking</div>
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
+        <div id="health" class="status">checking</div>
+        <div id="jobStatus" class="status">idle</div>
+      </div>
     </div>
 
     <section class="hero">
@@ -596,6 +601,7 @@
         showMsg(msg, String(err.message || err), "error");
       } finally {
         $("saveVoiceBtn").disabled = false;
+        await checkJobStatus();
       }
     });
 
@@ -610,14 +616,20 @@
       if (!voice_id) return showMsg(msg, "Select a saved voice.", "error");
       if (!text) return showMsg(msg, "Enter text to generate.", "error");
 
-      $("ttsBtn").disabled = true;
-      showMsg(msg, "Generating…");
+      localJob = true;
+      setActionsEnabled(false);
+      showMsg(msg, "Generating… only one job runs at a time on the GPU.");
       try {
         const res = await fetch("/v1/tts", {
           method: "POST",
           headers: authHeaders(true),
           body: JSON.stringify({ text, voice_id, format: "wav" }),
         });
+        if (res.status === 429) {
+          const body = await res.json().catch(() => ({}));
+          const detail = body.detail || body;
+          throw new Error(detail.message || "Server is busy with another job. Try again shortly.");
+        }
         if (!res.ok) throw new Error(await res.text());
         const blob = await res.blob();
         audioEl.src = URL.createObjectURL(blob);
@@ -626,13 +638,49 @@
       } catch (err) {
         showMsg(msg, String(err.message || err), "error");
       } finally {
-        $("ttsBtn").disabled = false;
+        localJob = false;
+        await checkJobStatus();
       }
     });
 
+    let localJob = false;
+
+    function setActionsEnabled(enabled) {
+      $("ttsBtn").disabled = !enabled;
+      // Saving a voice is light (ffmpeg) — still block while GPU job is active
+      // so users don't stack work while waiting.
+      if (!localJob) {
+        $("saveVoiceBtn").disabled = !enabled;
+      }
+    }
+
+    async function checkJobStatus() {
+      const el = $("jobStatus");
+      try {
+        const res = await fetch("/v1/status");
+        const data = await res.json();
+        if (data.busy) {
+          const kind = data.job || "job";
+          const secs = data.running_for_s != null ? ` · ${data.running_for_s}s` : "";
+          el.textContent = `busy · ${kind}${secs}`;
+          el.className = "status busy";
+          if (!localJob) setActionsEnabled(false);
+        } else {
+          el.textContent = "idle";
+          el.className = "status ok";
+          if (!localJob) setActionsEnabled(true);
+        }
+      } catch {
+        el.textContent = "unknown";
+        el.className = "status";
+      }
+    }
+
     checkHealth();
+    checkJobStatus();
     loadVoices();
     setInterval(checkHealth, 15000);
+    setInterval(checkJobStatus, 2000);
   </script>
 </body>
 </html>

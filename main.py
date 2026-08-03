@@ -11,10 +11,12 @@ Endpoints:
   POST /v1/tts     (saved voice: text + voice_id under /voices)
   GET  /v1/voices  (list saved voices)
   POST /v1/voices  (save a recorded/uploaded reference voice)
+  GET  /v1/status  (GPU job busy/idle — only one inference at a time)
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import shutil
 import subprocess
@@ -23,6 +25,7 @@ import logging
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -74,6 +77,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+# ---------------------------------------------------------------------------
+# Single-GPU job gate (only one inference job at a time)
+# ---------------------------------------------------------------------------
+
+
+class JobGate:
+    """Reject overlapping TTS jobs so two GPU inferences never run together."""
+
+    def __init__(self) -> None:
+        self._state = asyncio.Lock()
+        self.busy = False
+        self.kind: str | None = None
+        self.started_at: float | None = None
+
+    def snapshot(self) -> dict:
+        started = self.started_at
+        return {
+            "busy": self.busy,
+            "job": self.kind,
+            "started_at": started,
+            "running_for_s": (round(time.time() - started, 1) if started else 0),
+        }
+
+    @asynccontextmanager
+    async def run(self, kind: str):
+        async with self._state:
+            if self.busy:
+                snap = self.snapshot()
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail={
+                        "error": "busy",
+                        "message": (
+                            "Another generation job is already running. "
+                            "Wait for it to finish, then retry."
+                        ),
+                        **snap,
+                    },
+                )
+            self.busy = True
+            self.kind = kind
+            self.started_at = time.time()
+            logger.info("job acquired kind=%s", kind)
+        try:
+            yield
+        finally:
+            async with self._state:
+                logger.info(
+                    "job released kind=%s duration=%.1fs",
+                    kind,
+                    (time.time() - (self.started_at or time.time())),
+                )
+                self.busy = False
+                self.kind = None
+                self.started_at = None
+
+
+job_gate = JobGate()
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +408,18 @@ async def health():
     except Exception as exc:  # noqa: BLE001
         logger.warning("Backend health check failed: %s", exc)
 
-    payload = {"status": "ok" if backend_ok else "starting", "backend": backend_ok}
+    payload = {
+        "status": "ok" if backend_ok else "starting",
+        "backend": backend_ok,
+        "job": job_gate.snapshot(),
+    }
     return JSONResponse(content=payload, status_code=200 if backend_ok else 503)
+
+
+@app.get("/v1/status")
+async def job_status():
+    """Idle/busy probe so clients can avoid overlapping GPU jobs."""
+    return {"ok": True, **job_gate.snapshot()}
 
 
 @app.post("/v1/clone", dependencies=[Depends(require_api_key)])
@@ -382,7 +456,8 @@ async def clone_voice(body: CloneRequest):
         len(audio_bytes),
         body.format,
     )
-    return await _proxy_tts(payload)
+    async with job_gate.run("clone"):
+        return await _proxy_tts(payload)
 
 
 @app.post("/v1/tts", dependencies=[Depends(require_api_key)])
@@ -413,7 +488,8 @@ async def text_to_speech(body: TTSRequest):
         len(body.text),
         body.format,
     )
-    return await _proxy_tts(payload)
+    async with job_gate.run("tts"):
+        return await _proxy_tts(payload)
 
 
 @app.get("/v1/voices", dependencies=[Depends(require_api_key)])
