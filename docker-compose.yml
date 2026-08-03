@@ -15,6 +15,7 @@ services:
         CUDA_VER: "12.6.0"
         UV_EXTRA: "cu126"
         PY_VER: "3.12"
+        UV_VERSION: "0.8.15"
     image: fish-tts:coolify
     container_name: fish-tts
     restart: unless-stopped
