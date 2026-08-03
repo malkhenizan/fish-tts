@@ -1,10 +1,11 @@
-# Coolify: enable Git submodules (recursive) so fish-speech/ is present at build time.
 # Coolify Docker Compose — Fish TTS wrapper (RTX 3090 / CUDA)
 #
 # Coolify notes:
-# - Attach your domain to service `fish-tts` on port 8080
-# - Set API_KEY (and optional HF_TOKEN) in Coolify environment variables
-# - Ensure the Coolify host has NVIDIA Container Toolkit installed
+# - Do NOT publish host ports (ports:). Coolify's proxy attaches to the
+#   container network and will fail if 8080 is already bound on the host.
+# - In Coolify UI: set domain → service fish-tts → port 8080
+# - Set API_KEY (and optional HF_TOKEN) as env vars
+# - Host needs NVIDIA Container Toolkit
 
 services:
   fish-tts:
@@ -17,14 +18,14 @@ services:
         PY_VER: "3.12"
         FISH_SPEECH_REF: "main"
     image: fish-tts:coolify
-    container_name: fish-tts
     restart: unless-stopped
 
     # Older Docker / some Coolify hosts still honor runtime
     runtime: nvidia
 
-    ports:
-      - "8080:8080"
+    # Expose to Coolify network only — do not bind 0.0.0.0:8080 on the host
+    expose:
+      - "8080"
 
     environment:
       PORT: "8080"
@@ -40,11 +41,9 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
 
     volumes:
-      # Survive rebuilds / redeploys
       - fish_tts_checkpoints:/app/checkpoints
       - fish_tts_voices:/app/voices
 
-    # Compose GPU reservation (Swarm-compatible; also respected by recent Compose)
     deploy:
       resources:
         reservations:
