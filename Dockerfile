@@ -2,22 +2,17 @@
 #
 # Coolify / NVIDIA RTX 3090 (24GB) optimized image.
 #
-# Build args (match host driver CUDA):
-#   CUDA 12.6 -> UV_EXTRA=cu126  (default; broad driver compatibility)
-#   CUDA 12.8 -> UV_EXTRA=cu128
-#   CUDA 12.9 -> UV_EXTRA=cu129  (upstream fish-speech default)
+# IMPORTANT: Do NOT use ARG expansion in FROM lines.
+# Coolify's BuildKit bake often passes empty --build-arg values, which
+# override Dockerfile defaults and produce invalid image refs like:
+#   nvidia/cuda:-cudnn-runtime-ubuntu
 #
-# fish-speech is cloned at build time (Coolify-safe). The git submodule at
-# ./fish-speech is for local development / tracking upstream updates.
+# To change CUDA/uv versions, edit the FROM tags below directly.
+# UV_EXTRA must match the CUDA major (cu126 for CUDA 12.6).
 
-# --- uv binary stage (ARG must sit immediately above this FROM) ---
-ARG UV_VERSION=0.8.15
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-bin
+FROM ghcr.io/astral-sh/uv:0.8.15 AS uv-bin
 
-# --- app image ---
-ARG CUDA_VER=12.6.0
-ARG UBUNTU_VER=24.04
-FROM nvidia/cuda:${CUDA_VER}-cudnn-runtime-ubuntu${UBUNTU_VER}
+FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
 
 ARG UV_EXTRA=cu126
 ARG PY_VER=3.12
@@ -62,7 +57,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy uv from the dedicated stage (avoids COPY --from=image:${VAR} expansion bugs under Coolify bake)
 COPY --from=uv-bin /uv /uvx /bin/
 
 WORKDIR /app
