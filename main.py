@@ -6,13 +6,19 @@ Architecture:
 
 Endpoints:
   GET  /health
+  GET  /           (simple web UI)
   POST /v1/clone   (zero-shot: text + base64 reference audio + transcript)
   POST /v1/tts     (saved voice: text + voice_id under /voices)
+  GET  /v1/voices  (list saved voices)
+  POST /v1/voices  (save a recorded/uploaded reference voice)
 """
 
 from __future__ import annotations
 
 import base64
+import shutil
+import subprocess
+import tempfile
 import logging
 import os
 import re
@@ -22,7 +28,8 @@ from typing import Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
@@ -38,7 +45,7 @@ FISH_SPEECH_BASE = f"http://{FISH_SPEECH_HOST}:{FISH_SPEECH_PORT}"
 VOICES_DIR = Path(os.getenv("VOICES_DIR", "/app/voices"))
 REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "600"))
 
-AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus", ".webm"}
 VOICE_ID_RE = re.compile(r"^[a-zA-Z0-9\-_ ]+$")
 
 logging.basicConfig(
@@ -130,6 +137,31 @@ class TTSRequest(BaseModel):
             raise ValueError(
                 "voice_id may only contain letters, numbers, hyphens, underscores, and spaces"
             )
+        return v
+
+
+class SaveVoiceRequest(BaseModel):
+    voice_id: str = Field(..., min_length=1, max_length=255)
+    reference_text: str = Field(..., min_length=1)
+    reference_audio: str = Field(..., description="Base64-encoded reference audio")
+    filename: str = Field("sample.webm", description="Original filename (used for extension hint)")
+
+    @field_validator("voice_id")
+    @classmethod
+    def validate_voice_id(cls, v: str) -> str:
+        v = v.strip()
+        if not VOICE_ID_RE.match(v):
+            raise ValueError(
+                "voice_id may only contain letters, numbers, hyphens, underscores, and spaces"
+            )
+        return v
+
+    @field_validator("reference_audio")
+    @classmethod
+    def strip_data_url(cls, v: str) -> str:
+        v = v.strip()
+        if "," in v and v.lower().startswith("data:"):
+            v = v.split(",", 1)[1]
         return v
 
 
@@ -268,6 +300,34 @@ async def _proxy_tts(payload: dict) -> Response:
     )
 
 
+def _to_wav_bytes(audio_bytes: bytes, filename_hint: str = "sample.webm") -> bytes:
+    """Normalize browser recordings (often webm/opus) to wav via ffmpeg."""
+    suffix = Path(filename_hint).suffix.lower() or ".webm"
+    if suffix == ".wav":
+        return audio_bytes
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        # Best-effort: store original bytes; Fish Speech may still decode via torchaudio.
+        return audio_bytes
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / f"input{suffix}"
+        dst = Path(tmp) / "output.wav"
+        src.write_bytes(audio_bytes)
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-i", str(src), "-ac", "1", "-ar", "44100", str(dst)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0 or not dst.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to convert audio to wav: {proc.stderr[-500:]}",
+            )
+        return dst.read_bytes()
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -294,9 +354,8 @@ async def clone_voice(body: CloneRequest):
     Zero-shot clone: synthesize `text` using inline reference audio + transcript.
     Returns raw audio bytes.
     """
-    audio_bytes = _decode_reference_audio(body.reference_audio)
+    audio_bytes = _to_wav_bytes(_decode_reference_audio(body.reference_audio), "reference.webm")
     # Fish Speech ServeReferenceAudio accepts base64 strings in JSON and decodes them.
-    # Sending base64 keeps the JSON payload compact and compatible.
     payload = {
         "text": body.text,
         "references": [
@@ -373,3 +432,41 @@ async def list_voices():
             continue
         voices.append(entry.name)
     return {"voices": voices}
+
+
+@app.post("/v1/voices", dependencies=[Depends(require_api_key)])
+async def save_voice(body: SaveVoiceRequest):
+    """Persist a reference voice pack under /voices/{voice_id}."""
+    voice_dir = VOICES_DIR / body.voice_id
+    if voice_dir.exists():
+        raise HTTPException(status_code=409, detail=f"voice_id '{body.voice_id}' already exists")
+
+    raw = _decode_reference_audio(body.reference_audio)
+    wav_bytes = _to_wav_bytes(raw, body.filename)
+
+    try:
+        voice_dir.mkdir(parents=True, exist_ok=False)
+        (voice_dir / "sample.wav").write_bytes(wav_bytes)
+        (voice_dir / "sample.lab").write_text(body.reference_text, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        if voice_dir.exists():
+            shutil.rmtree(voice_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save voice: {exc}") from exc
+
+    logger.info("saved voice_id=%s bytes=%d", body.voice_id, len(wav_bytes))
+    return {"success": True, "voice_id": body.voice_id}
+
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@app.get("/")
+async def ui_index():
+    index = STATIC_DIR / "index.html"
+    if not index.exists():
+        raise HTTPException(status_code=404, detail="UI not found")
+    return FileResponse(index)
+
+
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

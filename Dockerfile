@@ -79,6 +79,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY main.py /app/main.py
 COPY start.sh /app/start.sh
+COPY static /app/static
 RUN chmod +x /app/start.sh \
     && mkdir -p /app/checkpoints /app/voices \
     && ln -sfn /app/checkpoints /app/fish-speech/checkpoints \
