@@ -236,7 +236,7 @@
     <header>
       <div>
         <h1 class="brand">Fish TTS</h1>
-        <p class="sub">Record a reference voice, save it, then generate speech.</p>
+        <p class="sub">Record and save a voice, then generate speech from your saved voices.</p>
       </div>
       <div id="health" class="status">checking…</div>
     </header>
@@ -248,7 +248,7 @@
       </div>
 
       <div class="tabs" role="tablist">
-        <button class="tab" role="tab" id="tab-record" aria-selected="true" data-pane="pane-record">Record &amp; clone</button>
+        <button class="tab" role="tab" id="tab-record" aria-selected="true" data-pane="pane-record">Record voice</button>
         <button class="tab" role="tab" id="tab-generate" aria-selected="false" data-pane="pane-generate">Generate</button>
       </div>
 
@@ -272,22 +272,14 @@
         <label for="refText">Reference transcript (what you said in the recording)</label>
         <textarea id="refText" dir="auto" placeholder="Exact words spoken in the reference clip…"></textarea>
 
-        <label for="cloneText">Text to generate</label>
-        <textarea id="cloneText" dir="auto" placeholder="Type the speech you want in this voice…"></textarea>
-
+        <label for="voiceName">Voice name</label>
         <div class="row">
-          <button type="button" id="cloneBtn">Generate with this recording</button>
+          <input id="voiceName" type="text" placeholder="e.g. arabic-me" style="flex:1;min-width:180px" />
+          <button type="button" id="saveVoiceBtn">Save voice</button>
         </div>
-
-        <label for="voiceName">Save recording as a reusable voice</label>
-        <div class="row">
-          <input id="voiceName" type="text" placeholder="voice id, e.g. arabic-me" style="flex:1;min-width:180px" />
-          <button type="button" class="secondary" id="saveVoiceBtn">Save voice</button>
-        </div>
-        <p class="hint">Saved voices appear in the Generate tab.</p>
+        <p class="hint">This only saves the voice. Use the Generate tab to speak with it.</p>
 
         <div id="cloneMsg" class="msg" hidden></div>
-        <audio id="cloneAudio" controls hidden></audio>
       </section>
 
       <!-- GENERATE -->
@@ -313,7 +305,7 @@
       </section>
     </div>
 
-    <footer>API: <code>/v1/clone</code> · <code>/v1/tts</code> · <code>/v1/voices</code></footer>
+    <footer>Record voice → Save · Generate tab → pick voice + text</footer>
   </div>
 
   <script>
@@ -480,37 +472,6 @@
         }, 1000);
       } catch (err) {
         showMsg($("cloneMsg"), `Microphone error: ${err.message || err}`, "error");
-      }
-    });
-
-    $("cloneBtn").addEventListener("click", async () => {
-      const msg = $("cloneMsg");
-      const audioEl = $("cloneAudio");
-      audioEl.hidden = true;
-      if (!state.refBlob) return showMsg(msg, "Record or upload a reference clip first.", "error");
-      const reference_text = $("refText").value.trim();
-      const text = $("cloneText").value.trim();
-      if (!reference_text) return showMsg(msg, "Reference transcript is required.", "error");
-      if (!text) return showMsg(msg, "Enter text to generate.", "error");
-
-      $("cloneBtn").disabled = true;
-      showMsg(msg, "Generating… this can take a bit on first request.");
-      try {
-        const reference_audio = await blobToBase64(state.refBlob);
-        const res = await fetch("/v1/clone", {
-          method: "POST",
-          headers: authHeaders(true),
-          body: JSON.stringify({ text, reference_audio, reference_text, format: "wav" }),
-        });
-        if (!res.ok) throw new Error(await res.text());
-        const blob = await res.blob();
-        audioEl.src = URL.createObjectURL(blob);
-        audioEl.hidden = false;
-        showMsg(msg, "Done.", "ok");
-      } catch (err) {
-        showMsg(msg, String(err.message || err), "error");
-      } finally {
-        $("cloneBtn").disabled = false;
       }
     });
 
