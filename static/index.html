@@ -429,6 +429,32 @@
       return h;
     }
 
+    async function fetchJSON(url, options = {}, { timeoutMs = 600000, retries = 0 } = {}) {
+      let lastErr;
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        try {
+          const res = await fetch(url, { ...options, signal: ctrl.signal });
+          if (res.status === 429 && attempt < retries) {
+            await new Promise((r) => setTimeout(r, 2500 * (attempt + 1)));
+            continue;
+          }
+          return res;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < retries) {
+            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+          throw err;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      throw lastErr || new Error("request failed");
+    }
+
     function showMsg(el, text, type = "") {
       el.hidden = false;
       el.className = "msg" + (type ? ` ${type}` : "");
@@ -583,7 +609,7 @@
       showMsg(msg, "Saving voice…");
       try {
         const audio = await blobToBase64(state.refBlob);
-        const res = await fetch("/v1/voices", {
+        const res = await fetchJSON("/v1/voices", {
           method: "POST",
           headers: authHeaders(true),
           body: JSON.stringify({
@@ -592,7 +618,7 @@
             reference_audio: audio,
             filename: state.refName || "recording.webm",
           }),
-        });
+        }, { timeoutMs: 180000, retries: 0 });
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
         showMsg(msg, `Saved voice “${data.voice_id}”. Open Generate to use it.`, "ok");
@@ -620,11 +646,11 @@
       setActionsEnabled(false);
       showMsg(msg, "Generating… only one job runs at a time on the GPU.");
       try {
-        const res = await fetch("/v1/tts", {
+        const res = await fetchJSON("/v1/tts", {
           method: "POST",
           headers: authHeaders(true),
           body: JSON.stringify({ text, voice_id, format: "wav" }),
-        });
+        }, { timeoutMs: 600000, retries: 1 });
         if (res.status === 429) {
           const body = await res.json().catch(() => ({}));
           const detail = body.detail || body;

@@ -19,6 +19,8 @@ services:
         FISH_SPEECH_REF: "main"
     image: fish-tts:coolify
     restart: unless-stopped
+    stop_grace_period: 60s
+    shm_size: "2gb"
 
     # Older Docker / some Coolify hosts still honor runtime
     runtime: nvidia
@@ -34,6 +36,8 @@ services:
       DEVICE: "cuda"
       COMPILE: "1"
       HALF: "0"
+      BACKEND_READY_ATTEMPTS: "240"
+      DOWNLOAD_RETRIES: "3"
       API_KEY: "${API_KEY:-}"
       HF_TOKEN: "${HF_TOKEN:-}"
       HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
@@ -57,7 +61,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 300s
+      start_period: 600s
 
 volumes:
   fish_tts_checkpoints:

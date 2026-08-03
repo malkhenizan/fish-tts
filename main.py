@@ -3,38 +3,29 @@ Fish TTS — FastAPI wrapper around self-hosted fishaudio/fish-speech.
 
 Architecture:
   Coolify DNS -> :8080 (this app) -> 127.0.0.1:8081 (Fish Speech api_server)
-
-Endpoints:
-  GET  /health
-  GET  /           (simple web UI)
-  POST /v1/clone   (zero-shot: text + base64 reference audio + transcript)
-  POST /v1/tts     (saved voice: text + voice_id under /voices)
-  GET  /v1/voices  (list saved voices)
-  POST /v1/voices  (save a recorded/uploaded reference voice)
-  GET  /v1/status  (GPU job busy/idle — only one inference at a time)
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import shutil
-import subprocess
-import tempfile
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
@@ -47,6 +38,9 @@ FISH_SPEECH_PORT = int(os.getenv("FISH_SPEECH_PORT", "8081"))
 FISH_SPEECH_BASE = f"http://{FISH_SPEECH_HOST}:{FISH_SPEECH_PORT}"
 VOICES_DIR = Path(os.getenv("VOICES_DIR", "/app/voices"))
 REQUEST_TIMEOUT_S = float(os.getenv("REQUEST_TIMEOUT_S", "600"))
+MAX_REFERENCE_AUDIO_BYTES = int(os.getenv("MAX_REFERENCE_AUDIO_BYTES", str(20 * 1024 * 1024)))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "5000"))
+UPSTREAM_RETRIES = int(os.getenv("UPSTREAM_RETRIES", "1"))
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus", ".webm"}
 VOICE_ID_RE = re.compile(r"^[a-zA-Z0-9\-_ ]+$")
@@ -64,10 +58,32 @@ elif len(API_KEY) < 16:
 
 security = HTTPBearer(auto_error=False)
 
+# Shared HTTP client (created in lifespan)
+http_client: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global http_client
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(REQUEST_TIMEOUT_S, connect=10.0),
+        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+    )
+    logger.info("wrapper ready voices_dir=%s", VOICES_DIR)
+    try:
+        yield
+    finally:
+        if http_client is not None:
+            await http_client.aclose()
+            http_client = None
+
+
 app = FastAPI(
     title="Fish TTS Wrapper",
-    version="1.0.0",
+    version="1.1.0",
     description="Coolify-ready FastAPI gateway for fishaudio/fish-speech (S2-Pro).",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -79,9 +95,8 @@ app.add_middleware(
 )
 
 
-
 # ---------------------------------------------------------------------------
-# Single-GPU job gate (only one inference job at a time)
+# Single-GPU job gate
 # ---------------------------------------------------------------------------
 
 
@@ -94,7 +109,7 @@ class JobGate:
         self.kind: str | None = None
         self.started_at: float | None = None
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         started = self.started_at
         return {
             "busy": self.busy,
@@ -118,6 +133,7 @@ class JobGate:
                         ),
                         **snap,
                     },
+                    headers={"Retry-After": "5"},
                 )
             self.busy = True
             self.kind = kind
@@ -145,17 +161,17 @@ job_gate = JobGate()
 # ---------------------------------------------------------------------------
 
 
+def _strip_data_url(v: str) -> str:
+    v = v.strip()
+    if v.lower().startswith("data:") and "," in v:
+        return v.split(",", 1)[1]
+    return v
+
+
 class CloneRequest(BaseModel):
-    text: str = Field(..., min_length=1, description="Text to synthesize")
-    reference_audio: str = Field(
-        ...,
-        description="Base64-encoded reference audio (wav/mp3/flac/ogg/...)",
-    )
-    reference_text: str = Field(
-        ...,
-        min_length=1,
-        description="Exact transcript of the reference audio",
-    )
+    text: str = Field(..., min_length=1, max_length=MAX_TEXT_CHARS)
+    reference_audio: str = Field(..., min_length=1)
+    reference_text: str = Field(..., min_length=1, max_length=MAX_TEXT_CHARS)
     format: Literal["wav", "pcm", "mp3", "opus"] = "wav"
     temperature: float = Field(0.8, ge=0.1, le=1.0)
     top_p: float = Field(0.8, ge=0.1, le=1.0)
@@ -169,20 +185,12 @@ class CloneRequest(BaseModel):
     @field_validator("reference_audio")
     @classmethod
     def strip_data_url(cls, v: str) -> str:
-        v = v.strip()
-        if "," in v and v.lower().startswith("data:"):
-            v = v.split(",", 1)[1]
-        return v
+        return _strip_data_url(v)
 
 
 class TTSRequest(BaseModel):
-    text: str = Field(..., min_length=1, description="Text to synthesize")
-    voice_id: str = Field(
-        ...,
-        min_length=1,
-        max_length=255,
-        description="Folder name under /voices (maps to Fish Speech reference_id)",
-    )
+    text: str = Field(..., min_length=1, max_length=MAX_TEXT_CHARS)
+    voice_id: str = Field(..., min_length=1, max_length=255)
     format: Literal["wav", "pcm", "mp3", "opus"] = "wav"
     temperature: float = Field(0.8, ge=0.1, le=1.0)
     top_p: float = Field(0.8, ge=0.1, le=1.0)
@@ -206,9 +214,9 @@ class TTSRequest(BaseModel):
 
 class SaveVoiceRequest(BaseModel):
     voice_id: str = Field(..., min_length=1, max_length=255)
-    reference_text: str = Field(..., min_length=1)
-    reference_audio: str = Field(..., description="Base64-encoded reference audio")
-    filename: str = Field("sample.webm", description="Original filename (used for extension hint)")
+    reference_text: str = Field(..., min_length=1, max_length=MAX_TEXT_CHARS)
+    reference_audio: str = Field(..., min_length=1)
+    filename: str = Field("sample.webm", max_length=255)
 
     @field_validator("voice_id")
     @classmethod
@@ -223,23 +231,26 @@ class SaveVoiceRequest(BaseModel):
     @field_validator("reference_audio")
     @classmethod
     def strip_data_url(cls, v: str) -> str:
-        v = v.strip()
-        if "," in v and v.lower().startswith("data:"):
-            v = v.split(",", 1)[1]
-        return v
+        return _strip_data_url(v)
+
+    @field_validator("filename")
+    @classmethod
+    def safe_filename(cls, v: str) -> str:
+        name = Path(v).name.strip() or "sample.webm"
+        if name in {".", ".."} or "/" in name or "\\" in name:
+            return "sample.webm"
+        return name
 
 
 # ---------------------------------------------------------------------------
-# Auth + logging middleware
+# Auth + logging
 # ---------------------------------------------------------------------------
 
 
 async def require_api_key(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> None:
-    """Enforce Bearer API key when API_KEY is configured."""
     if not API_KEY:
-        # Dev-friendly: allow unauthenticated access if unset (log a warning once per process).
         return
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
@@ -258,15 +269,21 @@ async def require_api_key(
 @app.middleware("http")
 async def access_log_middleware(request: Request, call_next):
     started = time.perf_counter()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("unhandled error path=%s", request.url.path)
+        raise
     elapsed_ms = (time.perf_counter() - started) * 1000
-    logger.info(
-        "%s %s -> %s (%.1fms)",
-        request.method,
-        request.url.path,
-        response.status_code,
-        elapsed_ms,
-    )
+    # Keep health/status quieter in logs
+    if request.url.path not in {"/health", "/v1/status"}:
+        logger.info(
+            "%s %s -> %s (%.1fms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
     return response
 
 
@@ -291,11 +308,27 @@ def _decode_reference_audio(b64: str) -> bytes:
         raise HTTPException(status_code=400, detail=f"Invalid base64 reference_audio: {exc}") from exc
     if not audio:
         raise HTTPException(status_code=400, detail="reference_audio decoded to empty bytes")
+    if len(audio) > MAX_REFERENCE_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"reference_audio too large ({len(audio)} bytes). "
+                f"Max is {MAX_REFERENCE_AUDIO_BYTES} bytes."
+            ),
+        )
     return audio
 
 
 def _assert_voice_exists(voice_id: str) -> Path:
-    voice_dir = VOICES_DIR / voice_id
+    if not VOICE_ID_RE.match(voice_id):
+        raise HTTPException(status_code=400, detail="Invalid voice_id")
+
+    voice_dir = (VOICES_DIR / voice_id).resolve()
+    try:
+        voice_dir.relative_to(VOICES_DIR.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid voice_id path") from exc
+
     if not voice_dir.is_dir():
         raise HTTPException(
             status_code=404,
@@ -326,23 +359,51 @@ def _assert_voice_exists(voice_id: str) -> Path:
     return voice_dir
 
 
-async def _proxy_tts(payload: dict) -> Response:
-    url = f"{FISH_SPEECH_BASE}/v1/tts"
+async def _backend_healthy() -> bool:
+    client = http_client
+    if client is None:
+        return False
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+        resp = await client.get(f"{FISH_SPEECH_BASE}/v1/health", timeout=2.0)
+        return resp.status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _proxy_tts(payload: dict) -> Response:
+    client = http_client
+    if client is None:
+        raise HTTPException(status_code=503, detail="HTTP client not ready")
+
+    url = f"{FISH_SPEECH_BASE}/v1/tts"
+    last_exc: Exception | None = None
+    upstream: httpx.Response | None = None
+
+    attempts = max(1, UPSTREAM_RETRIES + 1)
+    for attempt in range(1, attempts + 1):
+        try:
             upstream = await client.post(
                 url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-    except httpx.ConnectError as exc:
+            last_exc = None
+            break
+        except httpx.ConnectError as exc:
+            last_exc = exc
+            logger.warning("upstream connect failed attempt=%s/%s: %s", attempt, attempts, exc)
+            if attempt < attempts:
+                await asyncio.sleep(min(2 * attempt, 5))
+                continue
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail="Fish Speech backend timed out") from exc
+
+    if last_exc is not None or upstream is None:
         logger.exception("Fish Speech backend unreachable at %s", url)
         raise HTTPException(
             status_code=503,
             detail="Fish Speech backend is unavailable",
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Fish Speech backend timed out") from exc
+        ) from last_exc
 
     if upstream.status_code != 200:
         detail: object
@@ -351,7 +412,12 @@ async def _proxy_tts(payload: dict) -> Response:
         except Exception:  # noqa: BLE001
             detail = upstream.text
         logger.error("Upstream TTS failed (%s): %s", upstream.status_code, detail)
-        raise HTTPException(status_code=upstream.status_code, detail=detail)
+        # Map upstream 5xx to 503 so clients can retry cleanly
+        code = upstream.status_code if upstream.status_code < 500 else 503
+        raise HTTPException(status_code=code, detail=detail)
+
+    if not upstream.content:
+        raise HTTPException(status_code=502, detail="Upstream returned empty audio")
 
     audio_format = payload.get("format", "wav")
     return Response(
@@ -360,6 +426,7 @@ async def _proxy_tts(payload: dict) -> Response:
         headers={
             "Content-Disposition": f'inline; filename="speech.{audio_format}"',
             "X-Engine": "fish-speech",
+            "Cache-Control": "no-store",
         },
     )
 
@@ -372,24 +439,45 @@ def _to_wav_bytes(audio_bytes: bytes, filename_hint: str = "sample.webm") -> byt
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        # Best-effort: store original bytes; Fish Speech may still decode via torchaudio.
+        logger.warning("ffmpeg not found — storing/passing original audio bytes")
         return audio_bytes
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(prefix="fish-tts-") as tmp:
         src = Path(tmp) / f"input{suffix}"
         dst = Path(tmp) / "output.wav"
         src.write_bytes(audio_bytes)
         proc = subprocess.run(
-            [ffmpeg, "-y", "-i", str(src), "-ac", "1", "-ar", "44100", str(dst)],
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(src),
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                str(dst),
+            ],
             capture_output=True,
             text=True,
+            timeout=120,
         )
-        if proc.returncode != 0 or not dst.exists():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to convert audio to wav: {proc.stderr[-500:]}",
-            )
+        if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+            err = (proc.stderr or proc.stdout or "unknown ffmpeg error")[-500:]
+            raise HTTPException(status_code=400, detail=f"Failed to convert audio to wav: {err}")
         return dst.read_bytes()
+
+
+async def _require_backend_ready() -> None:
+    if not await _backend_healthy():
+        raise HTTPException(
+            status_code=503,
+            detail="Fish Speech backend is not ready yet. Retry shortly.",
+            headers={"Retry-After": "10"},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -400,14 +488,7 @@ def _to_wav_bytes(audio_bytes: bytes, filename_hint: str = "sample.webm") -> byt
 @app.get("/health")
 async def health():
     """Coolify / orchestrator health probe."""
-    backend_ok = False
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(f"{FISH_SPEECH_BASE}/v1/health")
-            backend_ok = resp.status_code == 200
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Backend health check failed: %s", exc)
-
+    backend_ok = await _backend_healthy()
     payload = {
         "status": "ok" if backend_ok else "starting",
         "backend": backend_ok,
@@ -418,18 +499,14 @@ async def health():
 
 @app.get("/v1/status")
 async def job_status():
-    """Idle/busy probe so clients can avoid overlapping GPU jobs."""
-    return {"ok": True, **job_gate.snapshot()}
+    backend_ok = await _backend_healthy()
+    return {"ok": True, "backend": backend_ok, **job_gate.snapshot()}
 
 
 @app.post("/v1/clone", dependencies=[Depends(require_api_key)])
 async def clone_voice(body: CloneRequest):
-    """
-    Zero-shot clone: synthesize `text` using inline reference audio + transcript.
-    Returns raw audio bytes.
-    """
+    await _require_backend_ready()
     audio_bytes = _to_wav_bytes(_decode_reference_audio(body.reference_audio), "reference.webm")
-    # Fish Speech ServeReferenceAudio accepts base64 strings in JSON and decodes them.
     payload = {
         "text": body.text,
         "references": [
@@ -462,10 +539,7 @@ async def clone_voice(body: CloneRequest):
 
 @app.post("/v1/tts", dependencies=[Depends(require_api_key)])
 async def text_to_speech(body: TTSRequest):
-    """
-    Synthesize using a persisted voice pack under /voices/{voice_id}.
-    Expected files: sample.wav (or other audio) + sample.lab transcript.
-    """
+    await _require_backend_ready()
     _assert_voice_exists(body.voice_id)
     payload = {
         "text": body.text,
@@ -494,7 +568,6 @@ async def text_to_speech(body: TTSRequest):
 
 @app.get("/v1/voices", dependencies=[Depends(require_api_key)])
 async def list_voices():
-    """List available voice_id folders under /voices (handy for frontends)."""
     if not VOICES_DIR.exists():
         return {"voices": []}
 
@@ -512,20 +585,29 @@ async def list_voices():
 
 @app.post("/v1/voices", dependencies=[Depends(require_api_key)])
 async def save_voice(body: SaveVoiceRequest):
-    """Persist a reference voice pack under /voices/{voice_id}."""
+    """Persist a reference voice pack under /voices/{voice_id} (atomic write)."""
     voice_dir = VOICES_DIR / body.voice_id
     if voice_dir.exists():
         raise HTTPException(status_code=409, detail=f"voice_id '{body.voice_id}' already exists")
 
     raw = _decode_reference_audio(body.reference_audio)
-    wav_bytes = _to_wav_bytes(raw, body.filename)
+    wav_bytes = await asyncio.to_thread(_to_wav_bytes, raw, body.filename)
 
+    staging = VOICES_DIR / f".tmp-{body.voice_id}-{os.getpid()}"
     try:
-        voice_dir.mkdir(parents=True, exist_ok=False)
-        (voice_dir / "sample.wav").write_bytes(wav_bytes)
-        (voice_dir / "sample.lab").write_text(body.reference_text, encoding="utf-8")
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=False)
+        (staging / "sample.wav").write_bytes(wav_bytes)
+        (staging / "sample.lab").write_text(body.reference_text, encoding="utf-8")
+        # Atomic publish
+        staging.rename(voice_dir)
+    except FileExistsError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise HTTPException(status_code=409, detail=f"voice_id '{body.voice_id}' already exists") from exc
     except Exception as exc:  # noqa: BLE001
-        if voice_dir.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+        if voice_dir.exists() and not any(voice_dir.iterdir()):
             shutil.rmtree(voice_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Failed to save voice: {exc}") from exc
 
@@ -541,7 +623,7 @@ async def ui_index():
     index = STATIC_DIR / "index.html"
     if not index.exists():
         raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(index)
+    return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
 
 if STATIC_DIR.is_dir():
