@@ -42,11 +42,15 @@ if ! weights_present; then
   fi
   log "checkpoints/s2-pro missing or empty — downloading fishaudio/s2-pro..."
   mkdir -p "${S2_PRO_DIR}"
-  # Prefer huggingface-cli (requested); fall back to `hf download`.
-  if command -v huggingface-cli >/dev/null 2>&1; then
-    huggingface-cli download fishaudio/s2-pro --local-dir "${S2_PRO_DIR}"
-  else
-    hf download fishaudio/s2-pro --local-dir "${S2_PRO_DIR}"
+  # huggingface-cli is a deprecated stub now; always use `hf`.
+  if ! command -v hf >/dev/null 2>&1; then
+    log "ERROR: hf CLI not found (install huggingface_hub)"
+    exit 1
+  fi
+  hf download fishaudio/s2-pro --local-dir "${S2_PRO_DIR}"
+  if ! weights_present; then
+    log "ERROR: download finished but checkpoints/s2-pro still looks empty"
+    exit 1
   fi
   log "Weight download complete."
 else
